@@ -1,0 +1,68 @@
+name: Publish verified Mac installers
+on:
+  workflow_dispatch:
+    inputs:
+      apple_zip:
+        required: true
+        type: string
+      intel_zip:
+        required: true
+        type: string
+      apple_sha:
+        required: true
+        type: string
+      intel_sha:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APPLE_ZIP: ${{ inputs.apple_zip }}
+      INTEL_ZIP: ${{ inputs.intel_zip }}
+      APPLE_SHA: ${{ inputs.apple_sha }}
+      INTEL_SHA: ${{ inputs.intel_sha }}
+    steps:
+      - name: Verify packages and attach to the draft release
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,io,json,os,pathlib,re,urllib.request,urllib.parse,zipfile
+          repo=os.environ['GITHUB_REPOSITORY']
+          token=os.environ['GH_TOKEN']
+          def api(path):
+              request=urllib.request.Request('https://api.github.com'+path,headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','User-Agent':'BERLIN-release'})
+              with urllib.request.urlopen(request,timeout=120) as response:return json.load(response)
+          releases=api('/repos/'+repo+'/releases?per_page=100')
+          release=next(r for r in releases if r['tag_name']=='v2.0.0')
+          assert release['draft'] is True,'Published releases are immutable in this workflow'
+          for name,key in [('BERLIN-Mac-AppleSilicon.dmg','APPLE'),('BERLIN-Mac-Intel.dmg','INTEL')]:
+              url=os.environ[key+'_ZIP'];expected=os.environ[key+'_SHA']
+              host=urllib.parse.urlparse(url)
+              assert host.scheme=='https' and (host.hostname.endswith('.blob.core.windows.net') or host.hostname.endswith('.actions.githubusercontent.com'))
+              assert re.fullmatch('[a-f0-9]{64}',expected)
+              with urllib.request.urlopen(url,timeout=240) as response:archive=response.read()
+              with zipfile.ZipFile(io.BytesIO(archive)) as z:
+                  candidates=[entry for entry in z.namelist() if pathlib.PurePosixPath(entry).name==name]
+                  assert len(candidates)==1
+                  data=z.read(candidates[0])
+                  reports=[entry for entry in z.namelist() if entry.endswith('smoke-report.json')]
+                  assert len(reports)==1 and json.loads(z.read(reports[0]))['ok'] is True
+              assert hashlib.sha256(data).hexdigest()==expected,'Installer checksum mismatch'
+              current=api('/repos/'+repo+'/releases/'+str(release['id']))
+              existing=[asset for asset in current['assets'] if asset['name']==name]
+              if existing:
+                  assert existing[0].get('digest')=='sha256:'+expected,'Existing asset has different content'
+                  print(name+': already verified')
+                  continue
+              endpoint=release['upload_url'].split('{')[0]+'?name='+urllib.parse.quote(name)
+              assert urllib.parse.urlparse(endpoint).hostname=='uploads.github.com'
+              request=urllib.request.Request(endpoint,data=data,method='POST',headers={'Authorization':'Bearer '+token,'Content-Type':'application/octet-stream','User-Agent':'BERLIN-release'})
+              with urllib.request.urlopen(request,timeout=240) as response:result=json.load(response)
+              assert result['state']=='uploaded' and result['size']==len(data)
+              print(name+': verified and uploaded')
+          PY
